@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"sort"
 )
 
 // ---------------------------------------------------------------------------
@@ -67,6 +68,92 @@ type Edge struct {
 type Graph struct {
 	Nodes map[NodeID]*Node
 	Edges map[NodeID][]Edge // adjacency list
+	kd    *kdNode           // spatial index, built lazily via BuildIndex
+}
+
+// ---------------------------------------------------------------------------
+// K-D tree
+// ---------------------------------------------------------------------------
+
+// kdNode is one node in a 2-D tree that indexes graph Nodes by (Lat, Lon).
+// axis 0 = split on Lat, axis 1 = split on Lon.
+type kdNode struct {
+	node        *Node
+	left, right *kdNode
+	axis        int
+}
+
+// BuildIndex constructs the k-d tree over all nodes currently in the graph.
+// Call this once after Parse/ParseReader returns, before any NearestNode
+// queries. It is safe to call multiple times (rebuilds the index).
+func (g *Graph) BuildIndex() {
+	pts := make([]*Node, 0, len(g.Nodes))
+	for _, n := range g.Nodes {
+		pts = append(pts, n)
+	}
+	g.kd = buildKDTree(pts, 0)
+}
+
+// buildKDTree recursively partitions pts into a balanced k-d tree.
+func buildKDTree(pts []*Node, depth int) *kdNode {
+	if len(pts) == 0 {
+		return nil
+	}
+	axis := depth % 2
+	// Sort along the current axis so we can pick the median.
+	sort.Slice(pts, func(i, j int) bool {
+		if axis == 0 {
+			return pts[i].Lat < pts[j].Lat
+		}
+		return pts[i].Lon < pts[j].Lon
+	})
+	mid := len(pts) / 2
+	return &kdNode{
+		node:  pts[mid],
+		axis:  axis,
+		left:  buildKDTree(pts[:mid], depth+1),
+		right: buildKDTree(pts[mid+1:], depth+1),
+	}
+}
+
+// nearestSearch performs branch-and-bound nearest-neighbour search.
+// bestDist is the squared-degree distance to the current best candidate
+// (we compare in degree-space for speed; the final winner is verified with
+// HaversineMetres).
+func nearestSearch(kd *kdNode, lat, lon float64, best **Node, bestDist *float64) {
+	if kd == nil {
+		return
+	}
+	// Degree-space distance to this node (cheap proxy, no trig).
+	dLat := kd.node.Lat - lat
+	dLon := kd.node.Lon - lon
+	d2 := dLat*dLat + dLon*dLon
+	if d2 < *bestDist {
+		*bestDist = d2
+		*best = kd.node
+	}
+
+	// Decide which child to descend first (the side containing the query).
+	var first, second *kdNode
+	var diff float64
+	if kd.axis == 0 {
+		diff = lat - kd.node.Lat
+	} else {
+		diff = lon - kd.node.Lon
+	}
+	if diff <= 0 {
+		first, second = kd.left, kd.right
+	} else {
+		first, second = kd.right, kd.left
+	}
+
+	nearestSearch(first, lat, lon, best, bestDist)
+
+	// Only descend the far side if the splitting hyperplane is closer than
+	// our current best — this is the key pruning step.
+	if diff*diff < *bestDist {
+		nearestSearch(second, lat, lon, best, bestDist)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +230,7 @@ func HaversineMetres(lat1, lon1, lat2, lon2 float64) float64 {
 
 // Parse reads an OSM XML file and returns a routable pedestrian Graph.
 // wheelchairOnly, when true, drops steps and wheelchair=no ways.
+// The spatial index is built automatically before returning.
 func Parse(path string, wheelchairOnly bool) (*Graph, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -153,6 +241,7 @@ func Parse(path string, wheelchairOnly bool) (*Graph, error) {
 }
 
 // ParseReader reads OSM XML from an io.Reader.
+// The spatial index is built automatically before returning.
 func ParseReader(r io.Reader, wheelchairOnly bool) (*Graph, error) {
 	var raw osmXML
 	dec := xml.NewDecoder(r)
@@ -206,12 +295,48 @@ func ParseReader(r io.Reader, wheelchairOnly bool) (*Graph, error) {
 		}
 	}
 
+	// Build the spatial index so NearestNode is O(log n) from the start.
+	g.BuildIndex()
+
 	return g, nil
 }
 
 // NearestNode finds the graph node closest to (lat, lon) within maxDistMetres.
 // Returns (nodeID, found).
+//
+// If the k-d tree index has been built (it is built automatically by Parse and
+// ParseReader), the search runs in O(log n) average time. If the index is
+// absent for any reason it falls back to the O(n) linear scan.
 func (g *Graph) NearestNode(lat, lon, maxDistMetres float64) (NodeID, bool) {
+	if g.kd != nil {
+		return g.nearestKD(lat, lon, maxDistMetres)
+	}
+	return g.nearestLinear(lat, lon, maxDistMetres)
+}
+
+// nearestKD uses the k-d tree for O(log n) average-case lookup.
+func (g *Graph) nearestKD(lat, lon, maxDistMetres float64) (NodeID, bool) {
+	var best *Node
+	// Seed bestDist with a value corresponding to maxDistMetres in
+	// degree-space so the search prunes nodes that are already out of range.
+	// 1 degree ≈ 111 km; we use a conservative conversion to avoid false
+	// pruning due to the Lat/Lon asymmetry near the equator.
+	maxDeg := maxDistMetres / 111_000.0
+	bestDist := maxDeg * maxDeg
+
+	nearestSearch(g.kd, lat, lon, &best, &bestDist)
+	if best == nil {
+		return 0, false
+	}
+	// Verify the winner with the accurate haversine distance.
+	if HaversineMetres(lat, lon, best.Lat, best.Lon) > maxDistMetres {
+		return 0, false
+	}
+	return best.ID, true
+}
+
+// nearestLinear is the original O(n) fallback.
+func (g *Graph) nearestLinear(lat, lon, maxDistMetres float64) (NodeID, bool) {
 	best := maxDistMetres + 1
 	var bestID NodeID
 	found := false

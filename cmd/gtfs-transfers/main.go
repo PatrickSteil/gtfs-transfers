@@ -56,23 +56,20 @@ func main() {
 	gtfsOut := args[2]
 
 	fmt.Println("═══════════════════════════════════════════")
-	fmt.Println("  gtfs-transfers  –  pedestrian transfers")
+	fmt.Println("gtfs-transfers  –  pedestrian transfers")
 	fmt.Println("═══════════════════════════════════════════")
-	fmt.Printf("  GTFS input  : %s\n", gtfsIn)
-	fmt.Printf("  OSM input   : %s\n", osmIn)
-	fmt.Printf("  GTFS output : %s\n", gtfsOut)
-	fmt.Printf("  Max walk    : %.0f s (%.1f min)\n", cfg.MaxWalkingTime, cfg.MaxWalkingTime/60)
-	fmt.Printf("  Flat speed  : %.2f m/s\n", cfg.FlatSpeed)
-	fmt.Printf("  Stair ↑/↓   : %.2f / %.2f m/s\n", cfg.StairSpeedUp, cfg.StairSpeedDown)
-	fmt.Printf("  Wheelchair  : %v\n", cfg.WheelchairAccessible)
-	fmt.Printf("  Penalty     : %.0f s\n", cfg.TransferPenalty)
+	fmt.Printf("GTFS input  : %s\n", gtfsIn)
+	fmt.Printf("OSM input   : %s\n", osmIn)
+	fmt.Printf("GTFS output : %s\n", gtfsOut)
+	fmt.Printf("Max walk    : %.0f s (%.1f min)\n", cfg.MaxWalkingTime, cfg.MaxWalkingTime/60)
+	fmt.Printf("Flat speed  : %.2f m/s\n", cfg.FlatSpeed)
+	fmt.Printf("Stair ↑/↓   : %.2f / %.2f m/s\n", cfg.StairSpeedUp, cfg.StairSpeedDown)
+	fmt.Printf("Wheelchair  : %v\n", cfg.WheelchairAccessible)
+	fmt.Printf("Penalty     : %.0f s\n", cfg.TransferPenalty)
 	fmt.Println("───────────────────────────────────────────")
 
-	// ------------------------------------------------------------------
-	// 1. Parse GTFS
-	// ------------------------------------------------------------------
 	t0 := time.Now()
-	fmt.Println("\n[1/4] Parsing GTFS feed …")
+	fmt.Println("[1/4] Parsing GTFS feed …")
 	feed := gtfsparser.NewFeed()
 	opts := gtfsparser.ParseOptions{
 		UseDefValueOnError: true,
@@ -82,46 +79,37 @@ func main() {
 	if err := feed.Parse(gtfsIn); err != nil {
 		fatalf("GTFS parse error: %v", err)
 	}
-	fmt.Printf("  Stops: %d  Transfers (existing): %d  (%.1fs)\n",
+	fmt.Printf("Stops: %d  Transfers (existing): %d  (%.1fs)\n",
 		len(feed.Stops), len(feed.Transfers), time.Since(t0).Seconds())
 
-	// ------------------------------------------------------------------
-	// 2. Parse OSM
-	// ------------------------------------------------------------------
 	t1 := time.Now()
-	fmt.Println("\n[2/4] Parsing OSM graph …")
+	fmt.Println("[2/4] Parsing OSM graph …")
 	graph, err := osm.Parse(osmIn, cfg.WheelchairAccessible)
 	if err != nil {
 		fatalf("OSM parse error: %v", err)
 	}
-	fmt.Printf("  Nodes: %d  Edge lists: %d  (%.1fs)\n",
+	fmt.Printf("Nodes: %d  Edge lists: %d  (%.1fs)\n",
 		len(graph.Nodes), len(graph.Edges), time.Since(t1).Seconds())
 
-	// ------------------------------------------------------------------
-	// 3. Generate transfers
-	// ------------------------------------------------------------------
 	t2 := time.Now()
-	fmt.Println("\n[3/4] Generating transfers …")
+	fmt.Println("[3/4] Generating transfers …")
 	transfers.GenerateTransfers(feed, graph, cfg)
-	fmt.Printf("  Total transfers in feed: %d  (%.1fs)\n",
+	fmt.Printf("Total transfers in feed: %d  (%.1fs)\n",
 		len(feed.Transfers), time.Since(t2).Seconds())
 
-	// ------------------------------------------------------------------
-	// 4. Write GTFS
-	// ------------------------------------------------------------------
 	t3 := time.Now()
 	fmt.Println("\n[4/4] Writing GTFS feed …")
 	writer := gtfswriter.Writer{
 		Sorted:           true,
 		ExplicitCalendar: false,
-		KeepColOrder:     true,
 	}
-	if err := writer.Write(feed, gtfsOut); err != nil {
+	err = writer.Write(feed, gtfsOut)
+	if err != nil {
 		fatalf("GTFS write error: %v", err)
 	}
-	fmt.Printf("  Written to %s  (%.1fs)\n", gtfsOut, time.Since(t3).Seconds())
+	fmt.Printf("Written to %s  (%.1fs)\n", gtfsOut, time.Since(t3).Seconds())
 
-	fmt.Printf("\n  ✓ Done in %.2fs total\n", time.Since(t0).Seconds())
+	fmt.Printf("Done in %.2fs total\n", time.Since(t0).Seconds())
 }
 
 func fatalf(format string, args ...interface{}) {
