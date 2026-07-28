@@ -25,7 +25,7 @@ type StopNode struct {
 	NodeID osmgraph.NodeID
 }
 
-// isParentStop returns true for stops that belong to a station hierarchy as
+// isChildStop returns true for stops that belong to a station hierarchy as
 // a child entry (platform, entrance, generic node). Transfers are only
 // meaningful between top-level stops, i.e. those with no Parent_station.
 func isChildStop(stop *gtfs.Stop) bool {
@@ -38,7 +38,12 @@ func isChildStop(stop *gtfs.Stop) bool {
 func SnapStops(feed *gtfsparser.Feed, g *osmgraph.Graph) []StopNode {
 	result := make([]StopNode, 0, len(feed.Stops))
 	for _, stop := range feed.Stops {
-		if !isChildStop(stop) {
+		// BUG FIX: this condition was inverted (`!isChildStop`), which
+		// skipped every top-level stop and generated transfers only
+		// between child stops (platforms/entrances) — the opposite of
+		// what the doc-comment above promises and of what GTFS consumers
+		// expect. We want to skip child stops, not keep them.
+		if isChildStop(stop) {
 			continue
 		}
 		if !stop.HasLatLon() {
@@ -75,6 +80,11 @@ type transferEntry struct {
 // transfer_type=2 ("requires minimum transfer time") is used so that trip
 // planners respect the computed pedestrian duration.
 //
+// snapped is normally the result of a prior call to SnapStops; it is taken
+// as a parameter (rather than computed internally) so callers that also
+// need the stop→node mapping — e.g. to export it alongside a DIMACS graph —
+// can snap once and reuse the result.
+//
 // Work is parallelised over all source stops using a pool of
 // runtime.NumCPU() workers. Each worker owns its own Dijkstra WorkBuf so
 // heap allocations are amortised across the full run rather than paid on
@@ -83,10 +93,9 @@ func GenerateTransfers(
 	feed *gtfsparser.Feed,
 	g *osmgraph.Graph,
 	cfg config.WalkConfig,
+	snapped []StopNode,
 ) {
-	snapped := SnapStops(feed, g)
 	n2s := nodeToStops(snapped)
-	fmt.Printf("  Snapped %d of %d stops to OSM nodes\n", len(snapped), len(feed.Stops))
 
 	workers := runtime.NumCPU()
 	jobs := make(chan StopNode, workers*2)
@@ -114,6 +123,14 @@ func GenerateTransfers(
 				reached := osmgraph.DijkstraWithBuf(g, src.NodeID, cfg, buf)
 
 				// Collect candidate transfers locally before sending.
+				//
+				// NOTE: no extra "over budget" filter is needed here.
+				// DijkstraWithBuf already only returns nodes whose cost is
+				// <= cfg.MaxWalkingTime, so r.Seconds+cfg.TransferPenalty
+				// can never exceed cfg.MaxWalkingTime+cfg.TransferPenalty —
+				// the previous version of this code had a check for that
+				// which could never be true, and a "skipped" counter that
+				// was always zero because nothing ever incremented it.
 				var entries []transferEntry
 				for _, r := range reached {
 					dstStops, ok := n2s[r.NodeID]
@@ -121,9 +138,6 @@ func GenerateTransfers(
 						continue
 					}
 					totalSec := r.Seconds + cfg.TransferPenalty
-					if totalSec > cfg.MaxWalkingTime+cfg.TransferPenalty {
-						continue
-					}
 					for _, dst := range dstStops {
 						if dst.Id == src.Stop.Id {
 							continue
@@ -166,18 +180,15 @@ func GenerateTransfers(
 	// feed.Transfers is not safe for concurrent writes, so we funnel all
 	// mutations through here rather than locking.
 	// -----------------------------------------------------------------------
-	var generated, skipped int64
+	var generated int64
 	for entries := range results {
 		for _, e := range entries {
 			addTransfer(feed, e.from, e.to, e.seconds)
 			atomic.AddInt64(&generated, 1)
 		}
 	}
-	// skipped is counted inside the workers; we can collect it via a second
-	// channel if needed — left as a simple atomic here for illustration.
-	_ = skipped
 
-	fmt.Printf("  Generated %d transfers (%d skipped over budget)\n", generated, skipped)
+	fmt.Printf("  Generated %d transfers\n", generated)
 }
 
 // addTransfer upserts a transfer into feed.Transfers. If a transfer for the

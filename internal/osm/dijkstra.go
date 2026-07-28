@@ -1,15 +1,11 @@
-// This file adds WorkBuf (reusable per-worker allocations) and
-// DijkstraWithBuf so that the transfers package can amortise heap
-// allocations across the full Dijkstra run instead of paying them on
-// every call.
+// This file implements a bounded single-source Dijkstra search over the
+// pedestrian Graph. DijkstraWithBuf takes a reusable WorkBuf so that
+// callers running many searches (one per GTFS stop, in the transfers
+// package) can amortise heap/map allocations across the whole run instead
+// of paying them on every call. For a single one-off search, use:
 //
-// Your existing Dijkstra function is left untouched; it can simply
-// delegate to DijkstraWithBuf with a throw-away buffer:
-//
-//   func Dijkstra(g *Graph, src NodeID, cfg config.WalkConfig) []ReachedNode {
-//       buf := NewWorkBuf(len(g.Nodes))
-//       return DijkstraWithBuf(g, src, cfg, buf)
-//   }
+//   buf := osm.NewWorkBuf(len(g.Nodes))
+//   reached := osm.DijkstraWithBuf(g, src, cfg, buf)
 
 package osm
 

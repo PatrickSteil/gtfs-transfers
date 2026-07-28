@@ -41,3 +41,8 @@ func Default() WalkConfig {
 		TransferPenalty:      0,
 	}
 }
+
+// DefaultBikeSpeedMPS is a reasonable average urban cycling speed, used as
+// the default constant edge speed for the bicycle DIMACS export.
+// ~15 km/h.
+const DefaultBikeSpeedMPS = 4.17

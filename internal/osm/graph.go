@@ -1,6 +1,3 @@
-// Package osm parses OpenStreetMap data into a routable pedestrian graph.
-// It supports the plain OSM XML format (.osm) only; for PBF you can
-// pre-convert with osmconvert.
 package osm
 
 import (
@@ -9,12 +6,10 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 )
-
-// ---------------------------------------------------------------------------
-// Raw OSM XML structures
-// ---------------------------------------------------------------------------
 
 type osmXML struct {
 	Nodes []rawNode `xml:"node"`
@@ -43,59 +38,146 @@ type nd struct {
 	Ref int64 `xml:"ref,attr"`
 }
 
-// ---------------------------------------------------------------------------
-// Graph types
-// ---------------------------------------------------------------------------
+type parsedData struct {
+	Nodes []parsedNode
+	Ways  []parsedWay
+}
 
-// NodeID is an OSM node identifier.
+type parsedNode struct {
+	ID       NodeID
+	Lat, Lon float64
+}
+
+type parsedWay struct {
+	ID      int64
+	NodeIDs []int64
+	Tags    map[string]string
+}
+
+func decodeXML(r io.Reader) (*parsedData, error) {
+	var raw osmXML
+	dec := xml.NewDecoder(r)
+	if err := dec.Decode(&raw); err != nil {
+		return nil, fmt.Errorf("osm: xml decode: %w", err)
+	}
+
+	data := &parsedData{
+		Nodes: make([]parsedNode, len(raw.Nodes)),
+		Ways:  make([]parsedWay, len(raw.Ways)),
+	}
+	for i, n := range raw.Nodes {
+		data.Nodes[i] = parsedNode{ID: n.ID, Lat: n.Lat, Lon: n.Lon}
+	}
+	for i, w := range raw.Ways {
+		nodeIDs := make([]int64, len(w.NDs))
+		for j, ref := range w.NDs {
+			nodeIDs[j] = ref.Ref
+		}
+		data.Ways[i] = parsedWay{ID: w.ID, NodeIDs: nodeIDs, Tags: tagsMap(w.Tags)}
+	}
+	return data, nil
+}
+
 type NodeID = int64
 
-// Node is a point in the pedestrian graph.
 type Node struct {
 	ID  NodeID
 	Lat float64
 	Lon float64
 }
 
-// Edge is a directed pedestrian connection between two graph nodes.
 type Edge struct {
 	To       NodeID
 	Cost     float64 // travel time in seconds
 	IsStairs bool
 }
 
-// Graph is the in-memory pedestrian routing graph.
-type Graph struct {
-	Nodes map[NodeID]*Node
-	Edges map[NodeID][]Edge // adjacency list
-	kd    *kdNode           // spatial index, built lazily via BuildIndex
+type Mode int
+
+const (
+	ModeFoot Mode = iota
+	ModeBike
+)
+
+func (m Mode) String() string {
+	switch m {
+	case ModeFoot:
+		return "foot"
+	case ModeBike:
+		return "bike"
+	default:
+		return "unknown"
+	}
 }
 
-// ---------------------------------------------------------------------------
-// K-D tree
-// ---------------------------------------------------------------------------
+type Graph struct {
+	Mode  Mode
+	Nodes map[NodeID]*Node
+	Edges map[NodeID][]Edge
+	kd    *kdNode
 
-// kdNode is one node in a 2-D tree that indexes graph Nodes by (Lat, Lon).
-// axis 0 = split on Lat, axis 1 = split on Lon.
+	connected map[NodeID]bool
+
+	refCosLat float64
+}
+type kdPoint struct {
+	node *Node
+	x, y float64 // local equirectangular projection, metres
+}
+
 type kdNode struct {
-	node        *Node
+	pt          kdPoint
 	left, right *kdNode
 	axis        int
 }
 
-// BuildIndex constructs the k-d tree over all nodes currently in the graph.
-// Call this once after Parse/ParseReader returns, before any NearestNode
-// queries. It is safe to call multiple times (rebuilds the index).
+func degToRad(d float64) float64 { return d * math.Pi / 180 }
+
+func (g *Graph) project(lat, lon float64) (x, y float64) {
+	x = degToRad(lon) * earthRadius * g.refCosLat
+	y = degToRad(lat) * earthRadius
+	return x, y
+}
+
 func (g *Graph) BuildIndex() {
-	pts := make([]*Node, 0, len(g.Nodes))
-	for _, n := range g.Nodes {
-		pts = append(pts, n)
+	connected := make(map[NodeID]bool, len(g.Edges)*2)
+	for from, edges := range g.Edges {
+		if len(edges) == 0 {
+			continue
+		}
+		connected[from] = true
+		for _, e := range edges {
+			connected[e.To] = true
+		}
+	}
+	g.connected = connected
+
+	if len(connected) == 0 {
+		g.kd = nil
+		return
+	}
+
+	var sumLat float64
+	for id := range connected {
+		sumLat += g.Nodes[id].Lat
+	}
+	meanLat := sumLat / float64(len(connected))
+	g.refCosLat = math.Cos(degToRad(meanLat))
+	if g.refCosLat < 1e-6 {
+		g.refCosLat = 1e-6 // guard against graphs sitting exactly on a pole
+	}
+
+	pts := make([]kdPoint, 0, len(connected))
+	for id := range connected {
+		n := g.Nodes[id]
+		x, y := g.project(n.Lat, n.Lon)
+		pts = append(pts, kdPoint{node: n, x: x, y: y})
 	}
 	g.kd = buildKDTree(pts, 0)
 }
 
 // buildKDTree recursively partitions pts into a balanced k-d tree.
-func buildKDTree(pts []*Node, depth int) *kdNode {
+func buildKDTree(pts []kdPoint, depth int) *kdNode {
 	if len(pts) == 0 {
 		return nil
 	}
@@ -103,43 +185,37 @@ func buildKDTree(pts []*Node, depth int) *kdNode {
 	// Sort along the current axis so we can pick the median.
 	sort.Slice(pts, func(i, j int) bool {
 		if axis == 0 {
-			return pts[i].Lat < pts[j].Lat
+			return pts[i].x < pts[j].x
 		}
-		return pts[i].Lon < pts[j].Lon
+		return pts[i].y < pts[j].y
 	})
 	mid := len(pts) / 2
 	return &kdNode{
-		node:  pts[mid],
+		pt:    pts[mid],
 		axis:  axis,
 		left:  buildKDTree(pts[:mid], depth+1),
 		right: buildKDTree(pts[mid+1:], depth+1),
 	}
 }
 
-// nearestSearch performs branch-and-bound nearest-neighbour search.
-// bestDist is the squared-degree distance to the current best candidate
-// (we compare in degree-space for speed; the final winner is verified with
-// HaversineMetres).
-func nearestSearch(kd *kdNode, lat, lon float64, best **Node, bestDist *float64) {
+func nearestSearch(kd *kdNode, x, y float64, best **Node, bestDist *float64) {
 	if kd == nil {
 		return
 	}
-	// Degree-space distance to this node (cheap proxy, no trig).
-	dLat := kd.node.Lat - lat
-	dLon := kd.node.Lon - lon
-	d2 := dLat*dLat + dLon*dLon
+	dx := kd.pt.x - x
+	dy := kd.pt.y - y
+	d2 := dx*dx + dy*dy
 	if d2 < *bestDist {
 		*bestDist = d2
-		*best = kd.node
+		*best = kd.pt.node
 	}
 
-	// Decide which child to descend first (the side containing the query).
 	var first, second *kdNode
 	var diff float64
 	if kd.axis == 0 {
-		diff = lat - kd.node.Lat
+		diff = x - kd.pt.x
 	} else {
-		diff = lon - kd.node.Lon
+		diff = y - kd.pt.y
 	}
 	if diff <= 0 {
 		first, second = kd.left, kd.right
@@ -147,18 +223,12 @@ func nearestSearch(kd *kdNode, lat, lon float64, best **Node, bestDist *float64)
 		first, second = kd.right, kd.left
 	}
 
-	nearestSearch(first, lat, lon, best, bestDist)
+	nearestSearch(first, x, y, best, bestDist)
 
-	// Only descend the far side if the splitting hyperplane is closer than
-	// our current best — this is the key pruning step.
 	if diff*diff < *bestDist {
-		nearestSearch(second, lat, lon, best, bestDist)
+		nearestSearch(second, x, y, best, bestDist)
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Tag helpers
-// ---------------------------------------------------------------------------
 
 func tagsMap(tags []tag) map[string]string {
 	m := make(map[string]string, len(tags))
@@ -168,13 +238,11 @@ func tagsMap(tags []tag) map[string]string {
 	return m
 }
 
-// isPedestrian returns true when the OSM way is usable by pedestrians.
 func isPedestrian(tags map[string]string) bool {
 	hw := tags["highway"]
 	if hw == "" {
 		return false
 	}
-	// Exclude motor-only roads unless sidewalk is tagged.
 	switch hw {
 	case "motorway", "motorway_link", "trunk", "trunk_link":
 		return false
@@ -183,9 +251,27 @@ func isPedestrian(tags map[string]string) bool {
 		"secondary", "primary", "steps", "track", "corridor":
 		return true
 	}
-	// For everything else, allow if foot≠no.
 	if tags["foot"] == "no" {
 		return false
+	}
+	return true
+}
+
+func isBicycle(tags map[string]string) bool {
+	hw := tags["highway"]
+	if hw == "" {
+		return false
+	}
+	if tags["bicycle"] == "no" {
+		return false
+	}
+	switch hw {
+	case "motorway", "motorway_link":
+		return false // bicycles are illegal on motorways essentially everywhere
+	case "cycleway":
+		return true
+	case "footway", "pedestrian", "path", "steps", "corridor":
+		return tags["bicycle"] == "yes" || tags["bicycle"] == "designated"
 	}
 	return true
 }
@@ -205,13 +291,36 @@ func isWheelchairFriendly(tags map[string]string) bool {
 	return true
 }
 
-// ---------------------------------------------------------------------------
-// Geometry helpers
-// ---------------------------------------------------------------------------
+func isOnewayForMode(tags map[string]string, mode Mode) (oneway, reversed bool) {
+	if mode == ModeBike {
+		if v, ok := tags["oneway:bicycle"]; ok {
+			switch v {
+			case "no":
+				return false, false
+			case "yes", "1":
+				return true, false
+			case "-1":
+				return true, true
+			}
+		}
+		if tags["cycleway"] == "opposite" ||
+			tags["cycleway:left"] == "opposite" ||
+			tags["cycleway:right"] == "opposite" {
+			return false, false
+		}
+	}
+
+	switch tags["oneway"] {
+	case "yes", "1":
+		return true, false
+	case "-1":
+		return true, true
+	}
+	return false, false
+}
 
 const earthRadius = 6_371_000.0 // metres
 
-// HaversineMetres computes the great-circle distance between two WGS84 points.
 func HaversineMetres(lat1, lon1, lat2, lon2 float64) float64 {
 	φ1 := lat1 * math.Pi / 180
 	φ2 := lat2 * math.Pi / 180
@@ -224,58 +333,99 @@ func HaversineMetres(lat1, lon1, lat2, lon2 float64) float64 {
 	return earthRadius * c
 }
 
-// ---------------------------------------------------------------------------
-// Parser
-// ---------------------------------------------------------------------------
+type Format int
 
-// Parse reads an OSM XML file and returns a routable pedestrian Graph.
-// wheelchairOnly, when true, drops steps and wheelchair=no ways.
-// The spatial index is built automatically before returning.
-func Parse(path string, wheelchairOnly bool) (*Graph, error) {
+const (
+	FormatAuto Format = iota
+	FormatXML
+	FormatPBF
+)
+
+func detectFormat(path string) Format {
+	if strings.EqualFold(filepath.Ext(path), ".pbf") {
+		return FormatPBF
+	}
+	return FormatXML
+}
+
+func Parse(path string, mode Mode, wheelchairOnly bool) (*Graph, error) {
+	graphs, err := ParseMulti(path, []Mode{mode}, wheelchairOnly)
+	if err != nil {
+		return nil, err
+	}
+	return graphs[mode], nil
+}
+
+func ParseReader(r io.Reader, format Format, mode Mode, wheelchairOnly bool) (*Graph, error) {
+	graphs, err := ParseReaderMulti(r, format, []Mode{mode}, wheelchairOnly)
+	if err != nil {
+		return nil, err
+	}
+	return graphs[mode], nil
+}
+
+func ParseMulti(path string, modes []Mode, wheelchairOnly bool) (map[Mode]*Graph, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("osm: open %s: %w", path, err)
 	}
 	defer f.Close()
-	return ParseReader(f, wheelchairOnly)
+	return ParseReaderMulti(f, detectFormat(path), modes, wheelchairOnly)
 }
 
-// ParseReader reads OSM XML from an io.Reader.
-// The spatial index is built automatically before returning.
-func ParseReader(r io.Reader, wheelchairOnly bool) (*Graph, error) {
-	var raw osmXML
-	dec := xml.NewDecoder(r)
-	if err := dec.Decode(&raw); err != nil {
-		return nil, fmt.Errorf("osm: xml decode: %w", err)
+func ParseReaderMulti(r io.Reader, format Format, modes []Mode, wheelchairOnly bool) (map[Mode]*Graph, error) {
+	var data *parsedData
+	var err error
+	switch format {
+	case FormatPBF:
+		data, err = decodePBF(r)
+	default: // FormatAuto and FormatXML: a Reader has no filename to sniff
+		data, err = decodeXML(r)
+	}
+	if err != nil {
+		return nil, err
 	}
 
+	out := make(map[Mode]*Graph, len(modes))
+	for _, mode := range modes {
+		out[mode] = buildGraph(data, mode, wheelchairOnly)
+	}
+	return out, nil
+}
+
+func buildGraph(data *parsedData, mode Mode, wheelchairOnly bool) *Graph {
 	g := &Graph{
-		Nodes: make(map[NodeID]*Node, len(raw.Nodes)),
-		Edges: make(map[NodeID][]Edge, len(raw.Nodes)),
+		Mode:  mode,
+		Nodes: make(map[NodeID]*Node, len(data.Nodes)),
+		Edges: make(map[NodeID][]Edge, len(data.Nodes)),
 	}
 
-	// Index all nodes.
-	for i := range raw.Nodes {
-		n := &raw.Nodes[i]
+	for i := range data.Nodes {
+		n := &data.Nodes[i]
 		g.Nodes[n.ID] = &Node{ID: n.ID, Lat: n.Lat, Lon: n.Lon}
 	}
 
-	// Build adjacency list from ways.
-	for _, way := range raw.Ways {
-		tags := tagsMap(way.Tags)
-		if !isPedestrian(tags) {
+	for _, way := range data.Ways {
+		var usable bool
+		switch mode {
+		case ModeBike:
+			usable = isBicycle(way.Tags)
+		default:
+			usable = isPedestrian(way.Tags)
+		}
+		if !usable {
 			continue
 		}
-		if wheelchairOnly && !isWheelchairFriendly(tags) {
+		if mode == ModeFoot && wheelchairOnly && !isWheelchairFriendly(way.Tags) {
 			continue
 		}
-		stairs := isStairs(tags)
-		oneWay := tags["oneway"] == "yes" || tags["oneway"] == "1"
+		stairs := mode == ModeFoot && isStairs(way.Tags)
+		oneway, reversed := isOnewayForMode(way.Tags, mode)
 
-		nds := way.NDs
+		nds := way.NodeIDs
 		for i := 0; i < len(nds)-1; i++ {
-			aID := nds[i].Ref
-			bID := nds[i+1].Ref
+			aID := nds[i]
+			bID := nds[i+1]
 			a, okA := g.Nodes[aID]
 			b, okB := g.Nodes[bID]
 			if !okA || !okB {
@@ -283,30 +433,22 @@ func ParseReader(r io.Reader, wheelchairOnly bool) (*Graph, error) {
 			}
 			dist := HaversineMetres(a.Lat, a.Lon, b.Lat, b.Lon)
 
-			// Cost will be filled in by the caller with the actual
-			// walk config speeds; here we store raw distance and
-			// let the Dijkstra layer apply the speed model.
-			// We encode the edge cost as distance (metres) – the
-			// dijkstra package will convert using config.
-			g.Edges[aID] = append(g.Edges[aID], Edge{To: bID, Cost: dist, IsStairs: stairs})
-			if !oneWay {
-				g.Edges[bID] = append(g.Edges[bID], Edge{To: aID, Cost: dist, IsStairs: stairs})
+			from, to := aID, bID
+			if oneway && reversed {
+				from, to = bID, aID
+			}
+			g.Edges[from] = append(g.Edges[from], Edge{To: to, Cost: dist, IsStairs: stairs})
+			if !oneway {
+				g.Edges[to] = append(g.Edges[to], Edge{To: from, Cost: dist, IsStairs: stairs})
 			}
 		}
 	}
 
-	// Build the spatial index so NearestNode is O(log n) from the start.
 	g.BuildIndex()
 
-	return g, nil
+	return g
 }
 
-// NearestNode finds the graph node closest to (lat, lon) within maxDistMetres.
-// Returns (nodeID, found).
-//
-// If the k-d tree index has been built (it is built automatically by Parse and
-// ParseReader), the search runs in O(log n) average time. If the index is
-// absent for any reason it falls back to the O(n) linear scan.
 func (g *Graph) NearestNode(lat, lon, maxDistMetres float64) (NodeID, bool) {
 	if g.kd != nil {
 		return g.nearestKD(lat, lon, maxDistMetres)
@@ -317,30 +459,25 @@ func (g *Graph) NearestNode(lat, lon, maxDistMetres float64) (NodeID, bool) {
 // nearestKD uses the k-d tree for O(log n) average-case lookup.
 func (g *Graph) nearestKD(lat, lon, maxDistMetres float64) (NodeID, bool) {
 	var best *Node
-	// Seed bestDist with a value corresponding to maxDistMetres in
-	// degree-space so the search prunes nodes that are already out of range.
-	// 1 degree ≈ 111 km; we use a conservative conversion to avoid false
-	// pruning due to the Lat/Lon asymmetry near the equator.
-	maxDeg := maxDistMetres / 111_000.0
-	bestDist := maxDeg * maxDeg
+	bestDist := maxDistMetres * maxDistMetres
 
-	nearestSearch(g.kd, lat, lon, &best, &bestDist)
+	x, y := g.project(lat, lon)
+	nearestSearch(g.kd, x, y, &best, &bestDist)
 	if best == nil {
 		return 0, false
 	}
-	// Verify the winner with the accurate haversine distance.
 	if HaversineMetres(lat, lon, best.Lat, best.Lon) > maxDistMetres {
 		return 0, false
 	}
 	return best.ID, true
 }
 
-// nearestLinear is the original O(n) fallback.
 func (g *Graph) nearestLinear(lat, lon, maxDistMetres float64) (NodeID, bool) {
 	best := maxDistMetres + 1
 	var bestID NodeID
 	found := false
-	for _, n := range g.Nodes {
+	for id := range g.connected {
+		n := g.Nodes[id]
 		d := HaversineMetres(lat, lon, n.Lat, n.Lon)
 		if d < best {
 			best = d
