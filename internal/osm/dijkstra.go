@@ -1,12 +1,3 @@
-// This file implements a bounded single-source Dijkstra search over the
-// pedestrian Graph. DijkstraWithBuf takes a reusable WorkBuf so that
-// callers running many searches (one per GTFS stop, in the transfers
-// package) can amortise heap/map allocations across the whole run instead
-// of paying them on every call. For a single one-off search, use:
-//
-//   buf := osm.NewWorkBuf(len(g.Nodes))
-//   reached := osm.DijkstraWithBuf(g, src, cfg, buf)
-
 package osm
 
 import (
@@ -15,15 +6,10 @@ import (
 	"github.com/PatrickSteil/gtfs-transfers/internal/config"
 )
 
-// ReachedNode is one entry in the Dijkstra result set.
 type ReachedNode struct {
 	NodeID  NodeID
 	Seconds float64
 }
-
-// ---------------------------------------------------------------------------
-// Priority queue (min-heap on cost)
-// ---------------------------------------------------------------------------
 
 type pqItem struct {
 	nodeID NodeID
@@ -55,32 +41,13 @@ func (pq *priorityQueue) Pop() any {
 	return item
 }
 
-// ---------------------------------------------------------------------------
-// WorkBuf — reusable allocations owned by one worker goroutine
-// ---------------------------------------------------------------------------
-
-// WorkBuf holds the heap and distance map that Dijkstra needs on every call.
-// Allocate one per worker with NewWorkBuf and pass it to DijkstraWithBuf;
-// the buffer is reset at the start of each call so it can be reused safely.
 type WorkBuf struct {
-	// dist maps NodeID → best known cost so far.
-	// We reuse the map by deleting only the keys we touched rather than
-	// allocating a fresh map each call — O(reached) deletions vs O(n) GC.
-	dist map[NodeID]float64
-
-	// touched records every key written to dist this call so we can scrub
-	// them at the end without iterating the whole map.
+	dist    map[NodeID]float64
 	touched []NodeID
-
-	// pq is the priority queue, reset to length 0 between calls.
-	pq priorityQueue
-
-	// pool is a free-list of pqItems so we avoid per-item allocations.
-	pool []*pqItem
+	pq      priorityQueue
+	pool    []*pqItem
 }
 
-// NewWorkBuf allocates a WorkBuf sized for a graph with nodeCount nodes.
-// nodeCount is a hint; the buffer will grow if needed.
 func NewWorkBuf(nodeCount int) *WorkBuf {
 	return &WorkBuf{
 		dist:    make(map[NodeID]float64, nodeCount),
@@ -90,15 +57,12 @@ func NewWorkBuf(nodeCount int) *WorkBuf {
 	}
 }
 
-// reset prepares the buffer for a new Dijkstra call by clearing only the
-// entries written during the previous call.
 func (b *WorkBuf) reset() {
 	for _, id := range b.touched {
 		delete(b.dist, id)
 	}
 	b.touched = b.touched[:0]
 	b.pq = b.pq[:0]
-	// Return pooled items; we keep the backing array.
 	b.pool = b.pool[:0]
 }
 
@@ -117,18 +81,7 @@ func (b *WorkBuf) release(item *pqItem) {
 	b.pool = append(b.pool, item)
 }
 
-// ---------------------------------------------------------------------------
-// DijkstraWithBuf
-// ---------------------------------------------------------------------------
-
-// DijkstraWithBuf runs Dijkstra from src, reusing buf's allocations.
-// buf must not be shared between goroutines.
-//
-// Edges whose IsStairs flag is set are penalised by cfg.StairPenalty (a
-// multiplier on their cost); set it to 1.0 to treat stairs as flat.
-//
-// Adapt the speed / penalty arithmetic below to match your existing Dijkstra.
-func DijkstraWithBuf(g *Graph, src NodeID, cfg config.WalkConfig, buf *WorkBuf) []ReachedNode {
+func DijkstraWithBuf(g *Graph, src NodeID, mode config.Mode, maxSeconds float64, buf *WorkBuf) []ReachedNode {
 	buf.reset()
 
 	startItem := buf.acquire(src, 0)
@@ -144,32 +97,17 @@ func DijkstraWithBuf(g *Graph, src NodeID, cfg config.WalkConfig, buf *WorkBuf) 
 		curCost := cur.cost
 		buf.release(cur)
 
-		// Stale entry — a shorter path was already settled.
 		if best, ok := buf.dist[curID]; ok && curCost > best {
-			continue
+			continue // stale entry — a shorter path was already settled
 		}
 
-		// Convert settled cost (seconds) to a ReachedNode only if within
-		// the walking budget.
-		if curCost <= cfg.MaxWalkingTime {
+		if curCost <= maxSeconds {
 			reached = append(reached, ReachedNode{NodeID: curID, Seconds: curCost})
 		}
 
 		for _, edge := range g.Edges[curID] {
-			// Convert metres → seconds using configured walk speed.
-			// Stair edges are undirected so we can't know if the
-			// pedestrian is ascending or descending; average the two
-			// stair speeds as a reasonable approximation.
-			var speed float64
-			if edge.IsStairs {
-				speed = (cfg.StairSpeedUp + cfg.StairSpeedDown) / 2.0
-			} else {
-				speed = cfg.FlatSpeed
-			}
-			edgeSec := edge.Cost / speed
-
-			newCost := curCost + edgeSec
-			if newCost > cfg.MaxWalkingTime {
+			newCost := curCost + edge.TravelTimeSeconds(mode)
+			if newCost > maxSeconds {
 				continue // prune: can't reach anything useful via this edge
 			}
 

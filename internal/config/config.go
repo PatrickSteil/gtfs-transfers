@@ -1,48 +1,65 @@
-// Package config holds all tunable parameters for transfer generation.
 package config
 
-// WalkConfig controls how pedestrian travel times are computed during
-// the Dijkstra search on the OSM street graph.
-type WalkConfig struct {
-	// MaxWalkingTime is the Dijkstra cutoff in seconds. Any station
-	// reachable within this budget is added as a transfer.
-	MaxWalkingTime float64
+import "math"
 
-	// FlatSpeed is the average walking speed on level footways, in m/s.
-	// Default: 1.39 m/s  (~5 km/h)
-	FlatSpeed float64
-
-	// StairSpeedUp is the effective vertical-progress speed (m/s of
-	// horizontal path) when ascending stairs.
-	// Default: 0.5 m/s
-	StairSpeedUp float64
-
-	// StairSpeedDown is the effective speed when descending stairs.
-	// Default: 0.7 m/s
-	StairSpeedDown float64
-
-	// WheelchairAccessible, when true, excludes OSM edges that are
-	// tagged with highway=steps or wheelchair=no/limited.
-	WheelchairAccessible bool
-
-	// TransferPenalty is a fixed number of seconds added to every
-	// generated transfer to account for e.g. station entry/exit time.
-	TransferPenalty float64
+type Mode struct {
+	Name     string
+	SpeedKmH float64
 }
 
-// Default returns a WalkConfig with sensible defaults.
-func Default() WalkConfig {
-	return WalkConfig{
-		MaxWalkingTime:       300, // 5 minutes
-		FlatSpeed:            1.39,
-		StairSpeedUp:         0.50,
-		StairSpeedDown:       0.70,
-		WheelchairAccessible: false,
-		TransferPenalty:      0,
+var (
+	ModeWalking = Mode{Name: "walking", SpeedKmH: 4.5}
+	ModeBike    = Mode{Name: "bike", SpeedKmH: 15.0}
+)
+
+const DefaultMaxSpeedKmH = 140.0
+
+func KmHToMS(kmh float64) float64 { return kmh / 3.6 }
+
+type PrepareConfig struct {
+	IdentifyDistM float64
+
+	ConnectDistM float64
+
+	BBox *BoundingBox
+
+	BBoxPadM float64
+}
+
+func DefaultPrepareConfig() PrepareConfig {
+	return PrepareConfig{
+		IdentifyDistM: 5.0,
+		ConnectDistM:  100.0,
+		BBoxPadM:      2000.0,
 	}
 }
 
-// DefaultBikeSpeedMPS is a reasonable average urban cycling speed, used as
-// the default constant edge speed for the bicycle DIMACS export.
-// ~15 km/h.
-const DefaultBikeSpeedMPS = 4.17
+type BoundingBox struct {
+	MinLat, MinLon, MaxLat, MaxLon float64
+}
+
+func (b *BoundingBox) Contains(lat, lon float64) bool {
+	if b == nil {
+		return true
+	}
+	return lat >= b.MinLat && lat <= b.MaxLat && lon >= b.MinLon && lon <= b.MaxLon
+}
+
+func (b *BoundingBox) PadMetres(padM float64) *BoundingBox {
+	if b == nil || padM <= 0 {
+		return b
+	}
+	const earthRadius = 6_371_000.0
+	dLat := padM / earthRadius * (180 / math.Pi)
+	cosLat := math.Cos((b.MinLat + b.MaxLat) / 2 * math.Pi / 180)
+	if cosLat < 1e-6 {
+		cosLat = 1e-6
+	}
+	dLon := padM / (earthRadius * cosLat) * (180 / math.Pi)
+	return &BoundingBox{
+		MinLat: b.MinLat - dLat,
+		MaxLat: b.MaxLat + dLat,
+		MinLon: b.MinLon - dLon,
+		MaxLon: b.MaxLon + dLon,
+	}
+}

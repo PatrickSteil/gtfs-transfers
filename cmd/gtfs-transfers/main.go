@@ -5,43 +5,49 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/PatrickSteil/gtfs-transfers/internal/config"
 	"github.com/PatrickSteil/gtfs-transfers/internal/osm"
+	"github.com/PatrickSteil/gtfs-transfers/internal/prepare"
 	"github.com/PatrickSteil/gtfs-transfers/internal/transfers"
 	gtfsparser "github.com/patrickbr/gtfsparser"
 	gtfswriter "github.com/patrickbr/gtfswriter"
 )
 
 func main() {
-	cfg := config.Default()
+	pcfg := config.DefaultPrepareConfig()
 
-	flag.Float64Var(&cfg.MaxWalkingTime, "max-walk", cfg.MaxWalkingTime,
-		"maximum walking time budget in seconds")
-	flag.Float64Var(&cfg.FlatSpeed, "flat-speed", cfg.FlatSpeed,
-		"average walking speed on flat footways (m/s)")
-	flag.Float64Var(&cfg.StairSpeedUp, "stair-up", cfg.StairSpeedUp,
-		"effective walking speed ascending stairs (m/s)")
-	flag.Float64Var(&cfg.StairSpeedDown, "stair-down", cfg.StairSpeedDown,
-		"effective walking speed descending stairs (m/s)")
-	flag.BoolVar(&cfg.WheelchairAccessible, "wheelchair", cfg.WheelchairAccessible,
-		"exclude stairs and wheelchair=no/limited paths")
-	flag.Float64Var(&cfg.TransferPenalty, "penalty", cfg.TransferPenalty,
-		"fixed penalty added to every transfer (seconds)")
-
+	var modesFlag string
+	var maxWalk float64
+	var bboxFlag string
 	var dimacsOut string
-	var dimacsModes string
-	var bikeSpeed float64
+	var dimacsScale float64
+	var noTransfers bool
+
+	flag.Float64Var(&pcfg.IdentifyDistM, "identify-dist", pcfg.IdentifyDistM,
+		"max distance (m) at which a stop is identified with an existing transfer-graph vertex")
+	flag.Float64Var(&pcfg.ConnectDistM, "connect-dist", pcfg.ConnectDistM,
+		"max distance (m) at which a stop is connected to the transfer graph with new edges")
+	flag.Float64Var(&pcfg.BBoxPadM, "bbox-pad", pcfg.BBoxPadM,
+		"padding (m) applied around the GTFS stops' extent for the automatic bounding box")
+	flag.StringVar(&bboxFlag, "bbox", "",
+		"explicit bounding box \"minLat,minLon,maxLat,maxLon\"; if unset, derived automatically from the GTFS stops")
+
+	flag.StringVar(&modesFlag, "modes", "walking:4.5,bike:15",
+		"comma-separated transfer modes as name:speed_kmh (paper defaults: walking=4.5, bike/e-scooter=15)")
+	flag.Float64Var(&maxWalk, "max-walk", 300,
+		"time budget in seconds for the GTFS transfers.txt entries generated for the first listed mode")
+	flag.BoolVar(&noTransfers, "no-transfers", false,
+		"skip generating transfers.txt entries (useful if you only want the -dimacs-out export)")
+
 	flag.StringVar(&dimacsOut, "dimacs-out", "",
-		"if set, export DIMACS graph(s) to this directory plus a stations.csv "+
-			"stop-to-node mapping")
-	flag.StringVar(&dimacsModes, "dimacs-modes", "foot,bike",
-		"comma-separated modes to export when -dimacs-out is set: foot, bike, or foot,bike")
-	flag.Float64Var(&bikeSpeed, "bike-speed", config.DefaultBikeSpeedMPS,
-		"constant bicycle speed used for the bike DIMACS export (m/s)")
+		"if set, export the prepared graph in DIMACS format to this directory: one shared graph_coords.co "+
+			"file plus one graph_<mode>.gr file per mode in -modes, and a stations.csv stop mapping")
+	flag.Float64Var(&dimacsScale, "dimacs-scale", 100,
+		"seconds -> integer-weight scale for the DIMACS export (100 = centiseconds)")
 
 	flag.Usage = usage
 	flag.Parse()
@@ -55,28 +61,37 @@ func main() {
 	osmIn := args[1]
 	gtfsOut := args[2]
 
-	var exportModes []osm.Mode
-	if dimacsOut != "" {
-		var err error
-		exportModes, err = parseModes(dimacsModes)
+	modes, err := parseModes(modesFlag)
+	if err != nil {
+		fatalf("%v", err)
+	}
+	if bboxFlag != "" {
+		bb, err := parseBBox(bboxFlag)
 		if err != nil {
 			fatalf("%v", err)
 		}
+		pcfg.BBox = bb
 	}
 
 	fmt.Println("═══════════════════════════════════════════")
-	fmt.Println("gtfs-transfers  –  pedestrian transfers")
+	fmt.Println("gtfs-transfers  –  GTFS + OSM transfer graph preparation")
 	fmt.Println("═══════════════════════════════════════════")
-	fmt.Printf("GTFS input  : %s\n", gtfsIn)
-	fmt.Printf("OSM input   : %s\n", osmIn)
-	fmt.Printf("GTFS output : %s\n", gtfsOut)
-	fmt.Printf("Max walk    : %.0f s (%.1f min)\n", cfg.MaxWalkingTime, cfg.MaxWalkingTime/60)
-	fmt.Printf("Flat speed  : %.2f m/s\n", cfg.FlatSpeed)
-	fmt.Printf("Stair ↑/↓   : %.2f / %.2f m/s\n", cfg.StairSpeedUp, cfg.StairSpeedDown)
-	fmt.Printf("Wheelchair  : %v\n", cfg.WheelchairAccessible)
-	fmt.Printf("Penalty     : %.0f s\n", cfg.TransferPenalty)
+	fmt.Printf("GTFS input     : %s\n", gtfsIn)
+	fmt.Printf("OSM input      : %s\n", osmIn)
+	fmt.Printf("GTFS output    : %s\n", gtfsOut)
+	fmt.Printf("Modes          : %s\n", describeModes(modes))
+	fmt.Printf("Identify dist  : %.0f m\n", pcfg.IdentifyDistM)
+	fmt.Printf("Connect dist   : %.0f m\n", pcfg.ConnectDistM)
+	if pcfg.BBox != nil {
+		fmt.Printf("Bounding box   : %.5f,%.5f,%.5f,%.5f (explicit)\n", pcfg.BBox.MinLat, pcfg.BBox.MinLon, pcfg.BBox.MaxLat, pcfg.BBox.MaxLon)
+	} else {
+		fmt.Printf("Bounding box   : auto (stop extent + %.0f m padding)\n", pcfg.BBoxPadM)
+	}
+	if !noTransfers {
+		fmt.Printf("Max walk       : %.0f s (mode: %s)\n", maxWalk, modes[0].Name)
+	}
 	if dimacsOut != "" {
-		fmt.Printf("DIMACS out  : %s (modes: %s)\n", dimacsOut, dimacsModes)
+		fmt.Printf("DIMACS out     : %s\n", dimacsOut)
 	}
 	fmt.Println("───────────────────────────────────────────")
 
@@ -94,43 +109,31 @@ func main() {
 	fmt.Printf("Stops: %d  Transfers (existing): %d  (%.1fs)\n",
 		len(feed.Stops), len(feed.Transfers), time.Since(t0).Seconds())
 
-	// Always parse the foot graph (needed for GTFS transfer generation).
-	// If a bike DIMACS export was requested, parse it in the same pass —
-	// ParseMulti decodes the OSM XML exactly once and builds both graphs
-	// from that single decode, rather than re-reading/re-parsing the file.
 	t1 := time.Now()
-	fmt.Println("[2/5] Parsing OSM graph(s) …")
-	parseModesList := []osm.Mode{osm.ModeFoot}
-	for _, m := range exportModes {
-		if m != osm.ModeFoot {
-			parseModesList = append(parseModesList, m)
-		}
-	}
-	graphs, err := osm.ParseMulti(osmIn, parseModesList, cfg.WheelchairAccessible)
+	fmt.Println("[2/5] Parsing OSM transfer graph …")
+	graph, err := osm.Parse(osmIn)
 	if err != nil {
 		fatalf("OSM parse error: %v", err)
 	}
-	graph := graphs[osm.ModeFoot]
-	for _, m := range parseModesList {
-		g := graphs[m]
-		fmt.Printf("  %-5s  nodes: %d  edge lists: %d\n", m, len(g.Nodes), len(g.Edges))
-	}
-	fmt.Printf("(%.1fs)\n", time.Since(t1).Seconds())
+	fmt.Printf("  %d nodes, %d edge lists  (%.1fs)\n", len(graph.Nodes), len(graph.Edges), time.Since(t1).Seconds())
 
 	t2 := time.Now()
-	fmt.Println("[3/5] Snapping stops to OSM nodes …")
-	snapped := transfers.SnapStops(feed, graph)
-	fmt.Printf("Snapped %d of %d stops to OSM nodes  (%.1fs)\n",
-		len(snapped), len(feed.Stops), time.Since(t2).Seconds())
+	fmt.Println("[3/5] Preparing combined transfer graph …")
+	fmt.Println("        connecting stops → contracting degree-1/2 vertices → bbox + largest component")
+	result := prepare.Prepare(feed, graph, pcfg)
+	fmt.Printf("  %s  (%.1fs)\n", result.Summary(), time.Since(t2).Seconds())
 
-	t3 := time.Now()
-	fmt.Println("[4/5] Generating transfers …")
-	transfers.GenerateTransfers(feed, graph, cfg, snapped)
-	fmt.Printf("Total transfers in feed: %d  (%.1fs)\n",
-		len(feed.Transfers), time.Since(t3).Seconds())
+	if !noTransfers {
+		t3 := time.Now()
+		fmt.Println("[4/5] Generating GTFS transfers.txt entries …")
+		transfers.GenerateTransfers(feed, result.Graph, modes[0], maxWalk, result.StopNode)
+		fmt.Printf("Total transfers in feed: %d  (%.1fs)\n", len(feed.Transfers), time.Since(t3).Seconds())
+	} else {
+		fmt.Println("[4/5] Skipping transfers.txt generation (-no-transfers)")
+	}
 
 	if dimacsOut != "" {
-		if err := exportDIMACS(dimacsOut, graphs, exportModes, cfg, bikeSpeed, feed, snapped); err != nil {
+		if err := exportDIMACS(dimacsOut, result, modes, dimacsScale, feed); err != nil {
 			fatalf("DIMACS export error: %v", err)
 		}
 	}
@@ -141,8 +144,7 @@ func main() {
 		Sorted:           true,
 		ExplicitCalendar: false,
 	}
-	err = writer.Write(feed, gtfsOut)
-	if err != nil {
+	if err := writer.Write(feed, gtfsOut); err != nil {
 		fatalf("GTFS write error: %v", err)
 	}
 	fmt.Printf("Written to %s  (%.1fs)\n", gtfsOut, time.Since(t4).Seconds())
@@ -150,116 +152,94 @@ func main() {
 	fmt.Printf("Done in %.2fs total\n", time.Since(t0).Seconds())
 }
 
-// parseModes parses a comma-separated list like "foot,bike" into []osm.Mode,
-// deduplicated and order-preserving.
-func parseModes(s string) ([]osm.Mode, error) {
-	seen := make(map[osm.Mode]bool)
-	var modes []osm.Mode
+// parseModes parses a comma-separated "name:speed_kmh" list, e.g.
+// "walking:4.5,bike:15,car:140". Order is preserved; the first mode is the
+// one used for transfers.txt generation.
+func parseModes(s string) ([]config.Mode, error) {
+	var modes []config.Mode
 	for _, part := range strings.Split(s, ",") {
-		part = strings.TrimSpace(strings.ToLower(part))
+		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
 		}
-		var m osm.Mode
-		switch part {
-		case "foot", "pedestrian", "walk":
-			m = osm.ModeFoot
-		case "bike", "bicycle", "cycling":
-			m = osm.ModeBike
-		default:
-			return nil, fmt.Errorf("unknown -dimacs-modes entry %q (expected foot or bike)", part)
+		nameSpeed := strings.SplitN(part, ":", 2)
+		if len(nameSpeed) != 2 {
+			return nil, fmt.Errorf("invalid -modes entry %q (want name:speed_kmh)", part)
 		}
-		if !seen[m] {
-			seen[m] = true
-			modes = append(modes, m)
+		speed, err := strconv.ParseFloat(strings.TrimSpace(nameSpeed[1]), 64)
+		if err != nil || speed <= 0 {
+			return nil, fmt.Errorf("invalid speed in -modes entry %q", part)
 		}
+		modes = append(modes, config.Mode{Name: strings.TrimSpace(nameSpeed[0]), SpeedKmH: speed})
 	}
 	if len(modes) == 0 {
-		return nil, fmt.Errorf("-dimacs-modes must name at least one of: foot, bike")
+		return nil, fmt.Errorf("-modes must name at least one mode")
 	}
 	return modes, nil
 }
 
-// exportDIMACS writes one DIMACS ".gr"/".co" pair per requested mode, plus
-// one combined stations.csv mapping GTFS stop IDs to each mode's OSM/DIMACS
-// node IDs, all into dir (created if it doesn't exist).
-//
-// footSnapped is the stop-snapping result already computed for the foot
-// graph in the main pipeline; it's reused here instead of re-snapping, so
-// only genuinely extra modes (e.g. bike) pay the snapping cost again.
-func exportDIMACS(
-	dir string,
-	graphs map[osm.Mode]*osm.Graph,
-	modes []osm.Mode,
-	cfg config.WalkConfig,
-	bikeSpeed float64,
-	feed *gtfsparser.Feed,
-	footSnapped []transfers.StopNode,
-) error {
+func describeModes(modes []config.Mode) string {
+	parts := make([]string, len(modes))
+	for i, m := range modes {
+		parts[i] = fmt.Sprintf("%s (%.1f km/h)", m.Name, m.SpeedKmH)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// parseBBox parses "minLat,minLon,maxLat,maxLon".
+func parseBBox(s string) (*config.BoundingBox, error) {
+	parts := strings.Split(s, ",")
+	if len(parts) != 4 {
+		return nil, fmt.Errorf("invalid -bbox %q (want minLat,minLon,maxLat,maxLon)", s)
+	}
+	vals := make([]float64, 4)
+	for i, p := range parts {
+		v, err := strconv.ParseFloat(strings.TrimSpace(p), 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid -bbox %q: %w", s, err)
+		}
+		vals[i] = v
+	}
+	return &config.BoundingBox{MinLat: vals[0], MinLon: vals[1], MaxLat: vals[2], MaxLon: vals[3]}, nil
+}
+
+// exportDIMACS writes one shared coordinates file, one .gr per mode (same
+// node numbering throughout — see osm/dimacs.go), and one stations.csv.
+func exportDIMACS(dir string, result prepare.Result, modes []config.Mode, scale float64, feed *gtfsparser.Feed) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create output dir: %w", err)
 	}
 
-	// Stable column order regardless of how -dimacs-modes was written.
-	sorted := append([]osm.Mode(nil), modes...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	index := result.Graph.NodeIndex()
 
-	var modeSnaps []transfers.ModeSnap
-	for _, mode := range sorted {
-		g, ok := graphs[mode]
-		if !ok {
-			return fmt.Errorf("internal error: no graph parsed for mode %s", mode)
-		}
-		index := g.NodeIndex()
+	coPath := filepath.Join(dir, "graph_coords.co")
+	coFile, err := os.Create(coPath)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", coPath, err)
+	}
+	if err := result.Graph.WriteDIMACSCoords(coFile, index); err != nil {
+		coFile.Close()
+		return fmt.Errorf("write %s: %w", coPath, err)
+	}
+	if err := coFile.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", coPath, err)
+	}
+	fmt.Printf("  %s (%d nodes, shared across all modes)\n", coPath, len(index))
 
-		var speed osm.EdgeSpeedFunc
-		if mode == osm.ModeBike {
-			speed = osm.ConstantSpeedFunc(bikeSpeed)
-		} else {
-			speed = osm.FootSpeedFunc(cfg)
-		}
-
-		grPath := filepath.Join(dir, "graph_"+mode.String()+".gr")
+	for _, mode := range modes {
+		grPath := filepath.Join(dir, "graph_"+sanitizeModeName(mode.Name)+".gr")
 		grFile, err := os.Create(grPath)
 		if err != nil {
 			return fmt.Errorf("create %s: %w", grPath, err)
 		}
-		if err := g.WriteDIMACSGraph(grFile, index, speed); err != nil {
+		if err := result.Graph.WriteDIMACSGraph(grFile, index, mode, scale); err != nil {
 			grFile.Close()
 			return fmt.Errorf("write %s: %w", grPath, err)
 		}
 		if err := grFile.Close(); err != nil {
 			return fmt.Errorf("close %s: %w", grPath, err)
 		}
-
-		coPath := filepath.Join(dir, "graph_"+mode.String()+".co")
-		coFile, err := os.Create(coPath)
-		if err != nil {
-			return fmt.Errorf("create %s: %w", coPath, err)
-		}
-		if err := g.WriteDIMACSCoords(coFile, index); err != nil {
-			coFile.Close()
-			return fmt.Errorf("write %s: %w", coPath, err)
-		}
-		if err := coFile.Close(); err != nil {
-			return fmt.Errorf("close %s: %w", coPath, err)
-		}
-
-		var snapped []transfers.StopNode
-		if mode == osm.ModeFoot {
-			snapped = footSnapped // reuse — already computed in the main pipeline
-		} else {
-			snapped = transfers.SnapStops(feed, g)
-		}
-
-		fmt.Printf("  %-5s  %s, %s (%d nodes, %d stops snapped)\n",
-			mode, grPath, coPath, len(index), len(snapped))
-
-		modeSnaps = append(modeSnaps, transfers.ModeSnap{
-			Mode:    mode.String(),
-			Snapped: snapped,
-			Index:   index,
-		})
+		fmt.Printf("  %s (mode: %s, %.1f km/h)\n", grPath, mode.Name, mode.SpeedKmH)
 	}
 
 	stationsPath := filepath.Join(dir, "stations.csv")
@@ -267,16 +247,22 @@ func exportDIMACS(
 	if err != nil {
 		return fmt.Errorf("create %s: %w", stationsPath, err)
 	}
-	if err := transfers.WriteStationMapping(stationsFile, modeSnaps); err != nil {
+	if err := transfers.WriteStationMapping(stationsFile, feed, result.StopNode, index); err != nil {
 		stationsFile.Close()
 		return fmt.Errorf("write %s: %w", stationsPath, err)
 	}
 	if err := stationsFile.Close(); err != nil {
 		return fmt.Errorf("close %s: %w", stationsPath, err)
 	}
-
 	fmt.Printf("  %s\n", stationsPath)
+
 	return nil
+}
+
+func sanitizeModeName(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	name = strings.ReplaceAll(name, " ", "_")
+	return name
 }
 
 func fatalf(format string, args ...interface{}) {
@@ -285,14 +271,20 @@ func fatalf(format string, args ...interface{}) {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `gtfs-transfers – generate pedestrian transfer entries for a GTFS feed
+	fmt.Fprintf(os.Stderr, `gtfs-transfers – prepare a combined GTFS + OSM transfer graph
+
+Following the procedure described in the paper this tool implements: build
+a single OSM transfer graph, connect GTFS stops to it geometrically,
+contract superfluous degree-1/2 vertices, then crop to a bounding box and
+its largest connected component. Every requested transfer mode reuses this
+same graph — only the travel speed varies (see -modes).
 
 Usage:
-  gtfs-transfers [flags] <gtfs-input> <osm-input.osm> <gtfs-output>
+  gtfs-transfers [flags] <gtfs-input> <osm-input> <gtfs-output>
 
 Arguments:
   gtfs-input    Path to GTFS ZIP file or directory (input)
-  osm-input     Path to OSM XML file (.osm) covering the same area
+  osm-input     Path to OSM data covering the same area: .osm/.xml or .osm.pbf
   gtfs-output   Path to write the enriched GTFS ZIP or directory
 
 Flags:
@@ -300,21 +292,20 @@ Flags:
 	flag.PrintDefaults()
 	fmt.Fprintf(os.Stderr, `
 Examples:
-  # Basic run with defaults (5-min walking budget)
-  gtfs-transfers feed.zip city.osm output/
+  # Default: walking transfers.txt, 5-minute budget
+  gtfs-transfers feed.zip city.osm.pbf output/
 
-  # Wheelchair-accessible transfers only, 3-minute budget
-  gtfs-transfers -wheelchair -max-walk 180 feed.zip city.osm output/
+  # Slower walkers, 3-minute budget
+  gtfs-transfers -modes "walking:3.5" -max-walk 180 feed.zip city.osm.pbf output/
 
-  # Slower walkers (elderly), with 60 s station entry penalty
-  gtfs-transfers -flat-speed 0.9 -penalty 60 feed.zip city.osm output/
+  # Also export the prepared graph (walking + bike weights) in DIMACS format
+  gtfs-transfers -dimacs-out dimacs/ feed.zip city.osm.pbf output/
 
-  # Also export foot AND bike DIMACS graphs (graph_foot.gr/.co,
-  # graph_bike.gr/.co) plus one combined stations.csv, into dimacs/
-  gtfs-transfers -dimacs-out dimacs/ feed.zip city.osm output/
+  # Only export DIMACS graphs for three modes, skip transfers.txt generation
+  gtfs-transfers -no-transfers -dimacs-out dimacs/ \
+    -modes "walking:4.5,bike:15,car:140" feed.zip city.osm.pbf output/
 
-  # Only the bike graph, with a faster assumed cycling speed
-  gtfs-transfers -dimacs-out dimacs/ -dimacs-modes bike -bike-speed 5.5 \
-    feed.zip city.osm output/
+  # Explicit bounding box instead of the automatic stop-extent + padding one
+  gtfs-transfers -bbox "49.3,8.6,49.5,8.8" feed.zip city.osm.pbf output/
 `)
 }

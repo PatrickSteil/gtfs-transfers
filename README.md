@@ -2,22 +2,6 @@
 
 Generates pedestrian **transfer entries** for a GTFS feed by routing through a real OpenStreetMap street graph. Each GTFS stop is snapped to its nearest OSM node; a bounded Dijkstra search is then run from that node and every reachable stop within the walking budget is written back as a `transfers.txt` entry with a realistic travel time.
 
-It can also export the underlying OSM graph — for pedestrians and/or bicycles — as [DIMACS](http://www.diag.uniroma1.it/~challenge9/) shortest-path files, with a stop-to-node mapping, for use with external routing tools or solvers.
-
-```
-[GTFS feed]  +  [OSM .osm / .pbf file]
-        │               │
-        └───────┬───────┘
-                ▼
-     snap stops → nearest OSM node
-                ▼
-     Dijkstra (per stop, bounded)
-                ▼
-   transfer_type=2 entries (min_transfer_time)
-                ▼
-        [enriched GTFS feed]
-```
-
 ---
 
 ## Features
