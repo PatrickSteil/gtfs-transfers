@@ -5,27 +5,30 @@ import (
 	"math"
 	"runtime"
 	"sync"
-	"sync/atomic"
 
 	"github.com/PatrickSteil/gtfs-transfers/internal/config"
 	osmgraph "github.com/PatrickSteil/gtfs-transfers/internal/osm"
-	gtfsparser "github.com/patrickbr/gtfsparser"
-	gtfs "github.com/patrickbr/gtfsparser/gtfs"
 )
 
-type transferEntry struct {
-	fromID  string
-	toID    string
-	seconds int
+// Entry is one computed (from, to) transfer with its travel time in
+// seconds, for one mode. It carries no assumption about where the stop
+// IDs came from (GTFS or a plain stops.csv) or where the result will be
+// written (transfers.txt vs. a plain CSV) — see gtfs.go and csv.go.
+type Entry struct {
+	FromID  string
+	ToID    string
+	Seconds int
 }
 
-func GenerateTransfers(
-	feed *gtfsparser.Feed,
+// ComputeTransfers runs a bounded Dijkstra fan-out from every stop in
+// stopNode over g and returns every (from, to) pair reached within
+// maxSeconds for the given mode.
+func ComputeTransfers(
 	g *osmgraph.Graph,
 	mode config.Mode,
 	maxSeconds float64,
 	stopNode map[string]osmgraph.NodeID,
-) {
+) []Entry {
 	nodeToStops := make(map[osmgraph.NodeID][]string, len(stopNode))
 	for id, nid := range stopNode {
 		nodeToStops[nid] = append(nodeToStops[nid], id)
@@ -36,7 +39,7 @@ func GenerateTransfers(
 		nodeID osmgraph.NodeID
 	}
 	jobs := make(chan job, runtime.NumCPU()*2)
-	results := make(chan []transferEntry, runtime.NumCPU()*2)
+	results := make(chan []Entry, runtime.NumCPU()*2)
 
 	var wg sync.WaitGroup
 	for range runtime.NumCPU() {
@@ -48,7 +51,7 @@ func GenerateTransfers(
 			for j := range jobs {
 				reached := osmgraph.DijkstraWithBuf(g, j.nodeID, mode, maxSeconds, buf)
 
-				var entries []transferEntry
+				var entries []Entry
 				for _, r := range reached {
 					dstIDs, ok := nodeToStops[r.NodeID]
 					if !ok {
@@ -58,10 +61,10 @@ func GenerateTransfers(
 						if dstID == j.stopID {
 							continue
 						}
-						entries = append(entries, transferEntry{
-							fromID:  j.stopID,
-							toID:    dstID,
-							seconds: int(math.Ceil(r.Seconds)),
+						entries = append(entries, Entry{
+							FromID:  j.stopID,
+							ToID:    dstID,
+							Seconds: int(math.Ceil(r.Seconds)),
 						})
 					}
 				}
@@ -84,38 +87,11 @@ func GenerateTransfers(
 		close(jobs)
 	}()
 
-	stopByID := make(map[string]*gtfs.Stop, len(feed.Stops))
-	for _, s := range feed.Stops {
-		stopByID[s.Id] = s
-	}
-
-	var generated int64
+	var all []Entry
 	for entries := range results {
-		for _, e := range entries {
-			from, to := stopByID[e.fromID], stopByID[e.toID]
-			if from == nil || to == nil {
-				continue
-			}
-			addTransfer(feed, from, to, e.seconds)
-			atomic.AddInt64(&generated, 1)
-		}
+		all = append(all, entries...)
 	}
 
-	fmt.Printf("  Generated %d transfers (%s)\n", generated, mode.Name)
-}
-
-func addTransfer(feed *gtfsparser.Feed, from, to *gtfs.Stop, seconds int) {
-	key := gtfs.TransferKey{
-		From_stop: from,
-		To_stop:   to,
-	}
-	if existing, ok := feed.Transfers[key]; ok {
-		if existing.Min_transfer_time <= seconds {
-			return // keep the shorter existing value
-		}
-	}
-	feed.Transfers[key] = gtfs.TransferVal{
-		Transfer_type:     2, // requires minimum transfer time
-		Min_transfer_time: seconds,
-	}
+	fmt.Printf("  Computed %d transfers (%s)\n", len(all), mode.Name)
+	return all
 }

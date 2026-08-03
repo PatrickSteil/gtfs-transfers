@@ -5,29 +5,29 @@ import (
 
 	"github.com/PatrickSteil/gtfs-transfers/internal/config"
 	osmgraph "github.com/PatrickSteil/gtfs-transfers/internal/osm"
-	gtfsparser "github.com/patrickbr/gtfsparser"
-	gtfs "github.com/patrickbr/gtfsparser/gtfs"
+	"github.com/PatrickSteil/gtfs-transfers/internal/stops"
 )
 
 // Result bundles the outputs of Prepare: the fully-prepared transfer graph
-// and the stop_id -> NodeID mapping for every top-level stop that survived
-// the whole pipeline (a stop can vanish if it — or the graph fragment it
-// connected to — fell outside the bounding box, or wasn't part of the
-// largest connected component).
+// and the stop_id -> NodeID mapping for every stop that survived the whole
+// pipeline (a stop can vanish if it — or the graph fragment it connected
+// to — fell outside the bounding box, or wasn't part of the largest
+// connected component).
 type Result struct {
 	Graph     *osmgraph.Graph
 	StopNode  map[string]osmgraph.NodeID
-	TotalTop  int // top-level stops considered
+	TotalTop  int // stops considered
 	Connected int // of those, how many survived into StopNode
 }
 
-// Prepare runs the paper's full graph-preparation procedure:
+// Prepare runs the paper's full graph-preparation procedure against a
+// stop basis (either GTFS- or CSV-derived — see internal/stops):
 //
-//  1. ConnectStops — identify/connect every GTFS stop with the OSM graph,
-//     retaining the feed's existing transfer edges.
+//  1. ConnectStops — identify/connect every stop with the OSM graph,
+//     retaining any existing transfer edges the source supplies.
 //  2. g.ContractDegreeOneTwo() — remove superfluous degree-1/2 vertices.
 //  3. g.ApplyBoundingBox(...) — crop to the study area (derived from the
-//     feed's stop extent, padded by cfg.BBoxPadM, if cfg.BBox is nil).
+//     stops' extent, padded by cfg.BBoxPadM, if cfg.BBox is nil).
 //  4. g.KeepLargestComponent() — discard every other fragment.
 //
 // Note the order: bounding-box/largest-component filtering runs *after*
@@ -35,15 +35,13 @@ type Result struct {
 // connected, we contract ... Finally, we remove remote and isolated
 // parts..."), and edge travel times are never pre-collapsed to a single
 // number before contraction — see Edge.Chain in osm/graph.go.
-func Prepare(feed *gtfsparser.Feed, g *osmgraph.Graph, cfg config.PrepareConfig) Result {
-	stops := topLevelStops(feed)
-
+func Prepare(src *stops.Source, g *osmgraph.Graph, cfg config.PrepareConfig) Result {
 	bbox := cfg.BBox
 	if bbox == nil {
-		bbox = boundingBoxOfStops(stops).PadMetres(cfg.BBoxPadM)
+		bbox = boundingBoxOfStops(src.Stops).PadMetres(cfg.BBoxPadM)
 	}
 
-	stopNode := ConnectStops(feed, g, cfg)
+	stopNode := ConnectStops(src, g, cfg)
 
 	g.ContractDegreeOneTwo()
 	g.ApplyBoundingBox(bbox)
@@ -61,32 +59,31 @@ func Prepare(feed *gtfsparser.Feed, g *osmgraph.Graph, cfg config.PrepareConfig)
 	return Result{
 		Graph:     g,
 		StopNode:  survived,
-		TotalTop:  len(stops),
+		TotalTop:  len(src.Stops),
 		Connected: len(survived),
 	}
 }
 
-func boundingBoxOfStops(stops []*gtfs.Stop) *config.BoundingBox {
-	if len(stops) == 0 {
+func boundingBoxOfStops(stopList []*stops.Stop) *config.BoundingBox {
+	if len(stopList) == 0 {
 		return nil
 	}
 	b := &config.BoundingBox{
-		MinLat: float64(stops[0].Lat), MaxLat: float64(stops[0].Lat),
-		MinLon: float64(stops[0].Lon), MaxLon: float64(stops[0].Lon),
+		MinLat: stopList[0].Lat, MaxLat: stopList[0].Lat,
+		MinLon: stopList[0].Lon, MaxLon: stopList[0].Lon,
 	}
-	for _, s := range stops[1:] {
-		lat, lon := float64(s.Lat), float64(s.Lon)
-		if lat < b.MinLat {
-			b.MinLat = lat
+	for _, s := range stopList[1:] {
+		if s.Lat < b.MinLat {
+			b.MinLat = s.Lat
 		}
-		if lat > b.MaxLat {
-			b.MaxLat = lat
+		if s.Lat > b.MaxLat {
+			b.MaxLat = s.Lat
 		}
-		if lon < b.MinLon {
-			b.MinLon = lon
+		if s.Lon < b.MinLon {
+			b.MinLon = s.Lon
 		}
-		if lon > b.MaxLon {
-			b.MaxLon = lon
+		if s.Lon > b.MaxLon {
+			b.MaxLon = s.Lon
 		}
 	}
 	return b

@@ -5,62 +5,49 @@ import (
 
 	"github.com/PatrickSteil/gtfs-transfers/internal/config"
 	osmgraph "github.com/PatrickSteil/gtfs-transfers/internal/osm"
-	gtfsparser "github.com/patrickbr/gtfsparser"
-	gtfs "github.com/patrickbr/gtfsparser/gtfs"
+	"github.com/PatrickSteil/gtfs-transfers/internal/stops"
 )
 
-func isChildStop(stop *gtfs.Stop) bool {
-	return stop.Parent_station != nil
-}
+// ConnectStops identifies/connects every stop in src with the OSM graph
+// (see the paper-style procedure in the package doc of pipeline.go),
+// retaining any existing transfer times supplied by src.Existing.
+func ConnectStops(src *stops.Source, g *osmgraph.Graph, cfg config.PrepareConfig) map[string]osmgraph.NodeID {
+	stopList := src.Stops
 
-func topLevelStops(feed *gtfsparser.Feed) []*gtfs.Stop {
-	out := make([]*gtfs.Stop, 0, len(feed.Stops))
-	for _, s := range feed.Stops {
-		if isChildStop(s) || !s.HasLatLon() {
-			continue
-		}
-		out = append(out, s)
-	}
-	return out
-}
-
-func ConnectStops(feed *gtfsparser.Feed, g *osmgraph.Graph, cfg config.PrepareConfig) map[string]osmgraph.NodeID {
-	stops := topLevelStops(feed)
-
-	idToStop := make([]*gtfs.Stop, len(stops))
-	pts := make([]osmgraph.IndexPoint, len(stops))
-	for i, s := range stops {
+	idToStop := make([]*stops.Stop, len(stopList))
+	pts := make([]osmgraph.IndexPoint, len(stopList))
+	for i, s := range stopList {
 		idToStop[i] = s
-		pts[i] = osmgraph.IndexPoint{ID: int64(i), Lat: float64(s.Lat), Lon: float64(s.Lon)}
+		pts[i] = osmgraph.IndexPoint{ID: int64(i), Lat: s.Lat, Lon: s.Lon}
 	}
 	stopIndex := osmgraph.NewPointIndex(pts)
 
-	result := make(map[string]osmgraph.NodeID, len(stops))
+	result := make(map[string]osmgraph.NodeID, len(stopList))
 
-	for _, v := range stops {
-		vLat, vLon := float64(v.Lat), float64(v.Lon)
+	for _, v := range stopList {
+		vLat, vLon := v.Lat, v.Lon
 
 		w, distVW, ok := g.NearestNode(vLat, vLon, math.Inf(1))
 		if !ok {
-			result[v.Id] = addStopVertex(g, v)
+			result[v.ID] = addStopVertex(g, v)
 			continue
 		}
 
 		mutual := false
 		if wNode := g.Nodes[w]; wNode != nil {
 			if nearestStopIdx, _, ok2 := stopIndex.Nearest(wNode.Lat, wNode.Lon, math.Inf(1)); ok2 {
-				mutual = idToStop[nearestStopIdx].Id == v.Id
+				mutual = idToStop[nearestStopIdx].ID == v.ID
 			}
 		}
 
 		if distVW < cfg.IdentifyDistM && mutual {
-			g.Nodes[w].StopIDs = append(g.Nodes[w].StopIDs, v.Id)
-			result[v.Id] = w
+			g.Nodes[w].StopIDs = append(g.Nodes[w].StopIDs, v.ID)
+			result[v.ID] = w
 			continue
 		}
 
 		nid := addStopVertex(g, v)
-		result[v.Id] = nid
+		result[v.ID] = nid
 
 		if distVW < cfg.ConnectDistM {
 			g.AddEdge(nid, osmgraph.Edge{To: w, Kind: osmgraph.EdgeConnector, DistM: distVW})
@@ -70,40 +57,38 @@ func ConnectStops(feed *gtfsparser.Feed, g *osmgraph.Graph, cfg config.PrepareCo
 
 	g.RebuildIndex()
 
-	retainExistingTransfers(feed, g, result)
+	retainExistingTransfers(src, g, result)
 	g.RebuildIndex()
 
 	return result
 }
 
-func addStopVertex(g *osmgraph.Graph, v *gtfs.Stop) osmgraph.NodeID {
+func addStopVertex(g *osmgraph.Graph, v *stops.Stop) osmgraph.NodeID {
 	nid := g.NewSyntheticNodeID()
 	g.Nodes[nid] = &osmgraph.Node{
 		ID:      nid,
-		Lat:     float64(v.Lat),
-		Lon:     float64(v.Lon),
-		StopIDs: []string{v.Id},
+		Lat:     v.Lat,
+		Lon:     v.Lon,
+		StopIDs: []string{v.ID},
 	}
 	return nid
 }
 
-func retainExistingTransfers(feed *gtfsparser.Feed, g *osmgraph.Graph, stopNode map[string]osmgraph.NodeID) {
-	for key, val := range feed.Transfers {
-		if val.Transfer_type != 2 {
-			continue
-		}
-		if key.From_stop == nil || key.To_stop == nil {
-			continue
-		}
-		fromID, ok1 := stopNode[key.From_stop.Id]
-		toID, ok2 := stopNode[key.To_stop.Id]
+// retainExistingTransfers adds src.Existing as graph edges (e.g. footpaths
+// already present in a GTFS feed's transfers.txt) so their original fixed
+// time is preserved rather than recomputed from OSM geometry. A CSV stop
+// basis has no equivalent source, so src.Existing is simply empty there.
+func retainExistingTransfers(src *stops.Source, g *osmgraph.Graph, stopNode map[string]osmgraph.NodeID) {
+	for _, t := range src.Existing {
+		fromID, ok1 := stopNode[t.FromID]
+		toID, ok2 := stopNode[t.ToID]
 		if !ok1 || !ok2 || fromID == toID {
 			continue
 		}
 		g.AddEdge(fromID, osmgraph.Edge{
 			To:           toID,
 			Kind:         osmgraph.EdgeRetained,
-			FixedSeconds: float64(val.Min_transfer_time),
+			FixedSeconds: float64(t.Seconds),
 		})
 	}
 }

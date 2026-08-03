@@ -7,21 +7,12 @@ import (
 	"strconv"
 
 	osmgraph "github.com/PatrickSteil/gtfs-transfers/internal/osm"
-	gtfsparser "github.com/patrickbr/gtfsparser"
+	"github.com/PatrickSteil/gtfs-transfers/internal/stops"
 )
 
-func WriteStationMapping(w io.Writer, feed *gtfsparser.Feed, stopNode map[string]osmgraph.NodeID, index map[osmgraph.NodeID]int) error {
-	stopByID := make(map[string]*struct {
-		Name     string
-		Lat, Lon float32
-	}, len(feed.Stops))
-	for _, s := range feed.Stops {
-		stopByID[s.Id] = &struct {
-			Name     string
-			Lat, Lon float32
-		}{Name: s.Name, Lat: s.Lat, Lon: s.Lon}
-	}
-
+// WriteStationMapping writes stop_id -> OSM/DIMACS node CSV rows for every
+// stop in src that survived into stopNode, sorted by stop_id.
+func WriteStationMapping(w io.Writer, src *stops.Source, stopNode map[string]osmgraph.NodeID, index map[osmgraph.NodeID]int) error {
 	ids := make([]string, 0, len(stopNode))
 	for id := range stopNode {
 		ids = append(ids, id)
@@ -35,8 +26,8 @@ func WriteStationMapping(w io.Writer, feed *gtfsparser.Feed, stopNode map[string
 
 	for _, id := range ids {
 		nid := stopNode[id]
-		s := stopByID[id]
-		if s == nil {
+		s, ok := src.Get(id)
+		if !ok {
 			continue
 		}
 		dimacsID := ""
@@ -48,8 +39,8 @@ func WriteStationMapping(w io.Writer, feed *gtfsparser.Feed, stopNode map[string
 		row := []string{
 			id,
 			s.Name,
-			strconv.FormatFloat(float64(s.Lat), 'f', 6, 64),
-			strconv.FormatFloat(float64(s.Lon), 'f', 6, 64),
+			strconv.FormatFloat(s.Lat, 'f', 6, 64),
+			strconv.FormatFloat(s.Lon, 'f', 6, 64),
 			strconv.FormatInt(nid, 10),
 			dimacsID,
 		}
